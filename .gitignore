@@ -1,0 +1,39 @@
+# Dataset (auto-downloaded by main.py on first run)
+data/*.xlsx
+data/*.csv
+data/*.zip
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+build/
+dist/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Report (kept separate from the codebase)
+outputs/results/
+generate_report.py
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local Claude config (if accidentally present)
+.claude/
+CLAUDE.md
