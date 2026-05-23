@@ -33,7 +33,3 @@ generate_report.py
 .DS_Store
 Thumbs.db
 desktop.ini
-
-# Local Claude config (if accidentally present)
-.claude/
-CLAUDE.md
