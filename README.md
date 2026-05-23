@@ -2,7 +2,6 @@
 
 An ML pipeline on the UCI Online Retail II dataset (~1M transactions, 2009–2011) that segments customers using their RFM behaviour and predicts which ones are likely to be top-quartile spenders.
 
-Built as the term project for **ED317 – Statistical Machine Learning I** at the Centre of Quantitative Economics and Data Science, BIT Mesra.
 
 ---
 
@@ -114,4 +113,4 @@ The script downloads `online_retail_II.xlsx` into `data/` on first run (~45 MB),
 Centre of Quantitative Economics and Data Science, BIT Mesra
 shreyamohan8340@gmail.com
 
-Submitted to: Dr. Manish Kumar Pandey
+
