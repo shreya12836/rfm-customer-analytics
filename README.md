@@ -111,6 +111,6 @@ The script downloads `online_retail_II.xlsx` into `data/` on first run (~45 MB),
 
 **Shreya Mishra** &nbsp;·&nbsp; IED/10032/23
 Centre of Quantitative Economics and Data Science, BIT Mesra
-shreyamohan8340@gmail.com
+shreyamohan840@gmail.com
 
 
