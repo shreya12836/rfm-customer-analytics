@@ -1,7 +1,7 @@
 """
 visualisation.py
 ----------------
-Publication-quality figures (>= 250 dpi PNG) saved to outputs/figures/:
+PNG figures saved at 300 dpi to outputs/figures/:
 
 - elbow.png                : K-Means inertia vs. k (elbow curve)
 - silhouette.png           : silhouette score vs. k
@@ -31,7 +31,7 @@ except ImportError:
     from utils import get_logger, get_paths  # type: ignore
 
 LOG = get_logger("visualisation")
-DPI = 300                                   # > 250 dpi required by spec
+DPI = 300
 sns.set_theme(style="whitegrid", context="paper")
 
 

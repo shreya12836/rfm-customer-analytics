@@ -1,8 +1,8 @@
 """
 evaluation.py
 -------------
-Aggregation of clustering & classification metrics into publication-ready
-CSV tables, plus SHAP-based explainability for the tree models.
+Aggregation of clustering and classification metrics into CSV tables,
+plus SHAP-based explainability for the tree models.
 
 CSV outputs (under outputs/tables)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -94,20 +94,37 @@ def model_comparison(metrics_df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 def shap_importance(model: Any, X: np.ndarray,
                     feature_names: list[str]) -> tuple[pd.DataFrame, Any]:
-    """Compute mean(|SHAP|) per feature using TreeExplainer when possible."""
+    """Compute mean(|SHAP|) per feature. Accepts a tree model or a Pipeline.
+
+    If a Pipeline is passed, transform steps before the final estimator
+    are applied to X first (e.g. StandardScaler). Resampling steps like
+    SMOTE have no transform method and are skipped.
+    """
     import shap
 
     LOG.info("Computing SHAP values ...")
+
+    tree_model, X_for_shap = model, X
+    if hasattr(model, "named_steps"):
+        names = list(model.named_steps)
+        final_name = names[-1]
+        X_for_shap = X
+        for step_name in names[:-1]:
+            step = model.named_steps[step_name]
+            if hasattr(step, "transform"):
+                X_for_shap = step.transform(X_for_shap)
+        tree_model = model.named_steps[final_name]
+
     try:
-        explainer = shap.TreeExplainer(model)
-        shap_values = explainer.shap_values(X)
+        explainer = shap.TreeExplainer(tree_model)
+        shap_values = explainer.shap_values(X_for_shap)
     except Exception as exc:
         LOG.warning("TreeExplainer failed (%s) -- falling back to KernelExplainer.",
                     exc)
-        background = shap.sample(X, 50, random_state=42)
-        explainer = shap.KernelExplainer(model.predict_proba, background)
-        shap_values = explainer.shap_values(X[:200])
-        X = X[:200]
+        background = shap.sample(X_for_shap, 50, random_state=42)
+        explainer = shap.KernelExplainer(tree_model.predict_proba, background)
+        shap_values = explainer.shap_values(X_for_shap[:200])
+        X_for_shap = X_for_shap[:200]
 
     if isinstance(shap_values, list):     # binary -> [class0, class1]
         sv = shap_values[1]
@@ -127,7 +144,7 @@ def shap_importance(model: Any, X: np.ndarray,
 # Persistence
 # ---------------------------------------------------------------------------
 def save_all(cluster_metrics: pd.DataFrame,
-             cluster_summary: pd.DataFrame,
+             cluster_summary: pd.DataFrame | None,
              clf_metrics: pd.DataFrame,
              comparison: pd.DataFrame,
              clf_results: dict,
@@ -135,8 +152,9 @@ def save_all(cluster_metrics: pd.DataFrame,
     paths = get_paths()
     cluster_metrics.to_csv(paths["tables"] / "clustering_metrics.csv",
                            index=False)
-    cluster_summary.to_csv(paths["tables"] / "cluster_summary.csv",
-                           index=False)
+    if cluster_summary is not None:
+        cluster_summary.to_csv(paths["tables"] / "cluster_summary.csv",
+                               index=False)
     clf_metrics.to_csv(paths["tables"] / "classification_metrics.csv",
                        index=False)
     comparison.to_csv(paths["tables"] / "model_comparison.csv", index=False)

@@ -1,0 +1,59 @@
+# Config for the CSV produced by examples/generate_synthetic.py.
+# The column names here are different from the UCI dataset, so this file
+# also serves as a worked example of how the schema section is used.
+#
+#     python examples/generate_synthetic.py
+#     python main.py --config configs/sample_synthetic.yaml
+
+dataset:
+  name: synthetic_demo
+  loader: csv
+  path: data/synthetic_transactions.csv
+  download_url: null
+
+schema:
+  customer_id: user_id
+  transaction_id: order_id
+  transaction_date: order_ts
+  quantity: units
+  unit_price: price_inr
+  revenue: null                      # computed as quantity * unit_price
+
+cleaning:
+  drop_cancellations:
+    enabled: true
+    method: negative_quantity        # synthetic data flags cancels with negative units
+  drop_missing_customer: true
+  drop_nonpositive: true
+  drop_duplicates: true
+  outliers:
+    method: iqr
+    k: 1.5
+    columns: [quantity, unit_price]
+
+features:
+  log_transform: true
+  scaler: standard
+  snapshot_date: auto
+
+target:
+  type: top_quantile
+  quantile: 0.75
+
+modeling:
+  test_size: 0.25
+  smote: true
+  cv_folds: 5
+  classifiers: [random_forest, xgboost, mlp]
+  cluster_models: [kmeans, gmm, ae_kmeans]   # DBSCAN tends to collapse on this size
+  k_range: [2, 8]
+  dbscan_eps: 0.5
+  dbscan_min_samples: 10
+  autoencoder:
+    epochs: 30                       # smaller dataset; fewer epochs are enough
+    batch_size: 64
+    lr: 0.001
+
+output:
+  figures_dir: outputs/figures
+  tables_dir: outputs/tables

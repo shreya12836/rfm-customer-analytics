@@ -1,0 +1,59 @@
+# Config for the UCI Online Retail II dataset.
+
+dataset:
+  name: online_retail_ii
+  loader: excel
+  path: data/online_retail_II.xlsx
+  download_url: https://archive.ics.uci.edu/ml/machine-learning-databases/00502/online_retail_II.xlsx
+  excel_sheets: all   # 'all' = concat every sheet, or list specific names
+
+# Map source columns -> canonical names used by the rest of the pipeline.
+schema:
+  customer_id: "Customer ID"         # Excel column has a space in the name
+  transaction_id: Invoice            # used for Frequency (n_unique invoices per customer)
+  transaction_date: InvoiceDate
+  quantity: Quantity
+  unit_price: Price
+  revenue: null                      # null => computed as quantity * unit_price
+
+cleaning:
+  drop_cancellations:
+    enabled: true
+    method: invoice_prefix           # 'invoice_prefix' or 'negative_quantity'
+    prefix: "C"
+  drop_missing_customer: true
+  drop_nonpositive: true             # drop rows with quantity<=0 or unit_price<=0
+  drop_duplicates: true
+  outliers:
+    method: iqr                      # 'iqr', 'zscore', or 'none'
+    k: 1.5
+    columns: [quantity, unit_price]  # canonical names
+
+features:
+  log_transform: true
+  scaler: standard                   # 'standard', 'robust', 'minmax', or 'none'
+  snapshot_date: auto                # 'auto' = max(transaction_date) + 1 day, or YYYY-MM-DD
+
+target:
+  type: top_quantile                 # 'top_quantile', 'threshold', or 'top_n'
+  quantile: 0.75
+  # threshold: 1000.0                # used when type=threshold
+  # top_n: 500                       # used when type=top_n
+
+modeling:
+  test_size: 0.25
+  smote: true
+  cv_folds: 5
+  classifiers: [random_forest, xgboost, mlp]
+  cluster_models: [kmeans, dbscan, gmm, ae_kmeans]
+  k_range: [2, 11]
+  dbscan_eps: 0.6
+  dbscan_min_samples: 10
+  autoencoder:
+    epochs: 50
+    batch_size: 64
+    lr: 0.001
+
+output:
+  figures_dir: outputs/figures
+  tables_dir: outputs/tables

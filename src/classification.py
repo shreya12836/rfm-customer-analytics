@@ -1,26 +1,21 @@
 """
 classification.py
 -----------------
-Supervised learning for high-value customer prediction.
+Supervised learning for the high-value customer label.
 
-Target definition
-~~~~~~~~~~~~~~~~~
-A customer is labelled ``high_value = 1`` if their total Monetary value
-falls in the **top 25%** of the population (i.e. above the 75th
-percentile). All others are labelled 0. This binary framing turns the
-business question -- "who should the marketing team prioritise?" --
-into a tractable classification problem.
+Target options (cfg.target.type):
+    top_quantile : Monetary > given quantile (default 0.75)
+    threshold    : Monetary > absolute amount
+    top_n        : top-N customers by Monetary
 
-Models
-~~~~~~
-- Random Forest
-- XGBoost (gradient-boosted trees)
-- Multi-Layer Perceptron (sklearn MLPClassifier)
+Models: Random Forest, XGBoost (falls back to GradientBoosting if
+xgboost is not installed), MLP. Which ones run is set in
+cfg.modeling.classifiers.
 
-Each model is trained on SMOTE-balanced data, scored with 5-fold
-stratified cross-validation, and finally evaluated on a held-out test
-set with accuracy / precision / recall / F1 / ROC-AUC plus the full
-classification report and confusion matrix.
+SMOTE is placed inside an imblearn.pipeline.Pipeline so that it is
+fit only on each CV training fold. Applying SMOTE once on the full
+training set before cross_val_score leaks information about held-out
+positives and pushes CV scores upward.
 """
 
 from __future__ import annotations
@@ -31,6 +26,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from imblearn.over_sampling import SMOTE
+from imblearn.pipeline import Pipeline as ImbPipeline
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
     accuracy_score,
@@ -47,8 +43,10 @@ from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
 
 try:
+    from .config import PipelineConfig
     from .utils import RANDOM_SEED, get_logger
 except ImportError:
+    from config import PipelineConfig  # type: ignore
     from utils import RANDOM_SEED, get_logger  # type: ignore
 
 LOG = get_logger("classification")
@@ -73,48 +71,66 @@ class ClfResult:
 # ---------------------------------------------------------------------------
 # Target construction
 # ---------------------------------------------------------------------------
-def make_target(rfm: pd.DataFrame, quantile: float = 0.75) -> pd.Series:
-    """Label customers above the chosen Monetary quantile as high-value."""
-    threshold = rfm["Monetary"].quantile(quantile)
-    LOG.info("High-value threshold (Monetary > %.2f) at q=%.2f",
-             threshold, quantile)
-    return (rfm["Monetary"] > threshold).astype(int)
+def make_target(rfm: pd.DataFrame, cfg: PipelineConfig) -> pd.Series:
+    """Build the binary high-value label per cfg.target.type."""
+    t = cfg.target
+    m = rfm["Monetary"]
+    if t.type == "top_quantile":
+        thr = m.quantile(t.quantile)
+        LOG.info("High-value: Monetary > %.2f (q=%.2f)", thr, t.quantile)
+        return (m > thr).astype(int)
+    if t.type == "threshold":
+        LOG.info("High-value: Monetary > %.2f (absolute)", t.threshold)
+        return (m > t.threshold).astype(int)
+    if t.type == "top_n":
+        n = min(t.top_n, len(rfm))
+        cutoff = m.nlargest(n).min()
+        LOG.info("High-value: top %d customers (Monetary >= %.2f)", n, cutoff)
+        return (m >= cutoff).astype(int)
+    raise ValueError(f"Unknown target type: {t.type}")
 
 
 def build_features(rfm: pd.DataFrame) -> pd.DataFrame:
-    """Use Recency and Frequency as predictors -- Monetary defines the label
-    so it must be excluded to avoid trivial leakage."""
+    """Return Recency + Frequency. Monetary defines the label so it is dropped."""
     return rfm[["Recency", "Frequency"]].copy()
 
 
 # ---------------------------------------------------------------------------
 # Pipeline pieces
 # ---------------------------------------------------------------------------
-def split_and_balance(X: pd.DataFrame, y: pd.Series, test_size: float = 0.25):
-    """Stratified split + StandardScaler + SMOTE oversampling on the train set."""
-    X_train, X_test, y_train, y_test = train_test_split(
+def split_data(X: pd.DataFrame, y: pd.Series, test_size: float):
+    """Stratified train/test split."""
+    return train_test_split(
         X, y, test_size=test_size, stratify=y, random_state=RANDOM_SEED
     )
 
-    scaler = StandardScaler().fit(X_train)
-    X_train_s = scaler.transform(X_train)
-    X_test_s = scaler.transform(X_test)
 
-    smote = SMOTE(random_state=RANDOM_SEED)
-    X_train_bal, y_train_bal = smote.fit_resample(X_train_s, y_train)
-    LOG.info("Train: %d -> %d after SMOTE (positives=%d)",
-             len(y_train), len(y_train_bal), int(y_train_bal.sum()))
-    return X_train_bal, X_test_s, y_train_bal, y_test, scaler
+def _build_pipeline(model, use_smote: bool) -> ImbPipeline:
+    """Build an imblearn Pipeline so scaling and SMOTE happen per CV fold."""
+    steps = [("scaler", StandardScaler())]
+    if use_smote:
+        steps.append(("smote", SMOTE(random_state=RANDOM_SEED)))
+    steps.append(("clf", model))
+    return ImbPipeline(steps=steps)
 
 
-def evaluate(name: str, model, X_test, y_test, X_train, y_train) -> ClfResult:
-    """Fit a model on (X_train, y_train) and score it on (X_test, y_test)."""
-    model.fit(X_train, y_train)
-    y_pred = model.predict(X_test)
+def evaluate(name: str, model, X_train, y_train, X_test, y_test,
+             cv_folds: int, use_smote: bool) -> ClfResult:
+    """Fit the pipeline, compute CV F1, and score on the test set."""
+    pipe = _build_pipeline(model, use_smote)
 
-    if hasattr(model, "predict_proba"):
-        y_proba = model.predict_proba(X_test)[:, 1]
-    else:                                      # safety fallback
+    cv = cross_val_score(
+        pipe, X_train, y_train,
+        cv=StratifiedKFold(n_splits=cv_folds, shuffle=True,
+                           random_state=RANDOM_SEED),
+        scoring="f1", n_jobs=-1,
+    )
+
+    pipe.fit(X_train, y_train)
+    y_pred = pipe.predict(X_test)
+    if hasattr(pipe, "predict_proba"):
+        y_proba = pipe.predict_proba(X_test)[:, 1]
+    else:
         y_proba = y_pred.astype(float)
 
     metrics = {
@@ -123,88 +139,83 @@ def evaluate(name: str, model, X_test, y_test, X_train, y_train) -> ClfResult:
         "recall": recall_score(y_test, y_pred, zero_division=0),
         "f1": f1_score(y_test, y_pred, zero_division=0),
         "roc_auc": roc_auc_score(y_test, y_proba),
+        "cv_f1_mean": float(cv.mean()),
+        "cv_f1_std": float(cv.std()),
     }
     fpr, tpr, thr = roc_curve(y_test, y_proba)
     cm = confusion_matrix(y_test, y_pred)
-
-    cv = cross_val_score(
-        model, X_train, y_train, cv=StratifiedKFold(
-            n_splits=5, shuffle=True, random_state=RANDOM_SEED),
-        scoring="f1",
-    )
-    metrics["cv_f1_mean"] = float(cv.mean())
-    metrics["cv_f1_std"] = float(cv.std())
-
     report = classification_report(y_test, y_pred, output_dict=True,
                                    zero_division=0)
     LOG.info("%s -> %s", name,
              {k: round(v, 4) for k, v in metrics.items()})
-    return ClfResult(name=name, model=model, metrics=metrics,
+    return ClfResult(name=name, model=pipe, metrics=metrics,
                      y_true=np.asarray(y_test), y_pred=y_pred,
                      y_proba=y_proba, roc_curve=(fpr, tpr, thr),
                      confusion=cm, cv_scores=cv, report=report)
 
 
 # ---------------------------------------------------------------------------
-# Models
+# Model registry
 # ---------------------------------------------------------------------------
-def get_models() -> dict:
-    """Construct the three classifiers used in the study."""
-    rf = RandomForestClassifier(
-        n_estimators=300, max_depth=None,
-        random_state=RANDOM_SEED, n_jobs=-1,
-    )
-
-    try:
-        from xgboost import XGBClassifier
-
-        xgb = XGBClassifier(
-            n_estimators=300, max_depth=5, learning_rate=0.1,
-            subsample=0.9, colsample_bytree=0.9,
-            random_state=RANDOM_SEED, eval_metric="logloss",
-            tree_method="hist", n_jobs=-1,
+def _make_model(name: str):
+    if name == "random_forest":
+        return RandomForestClassifier(
+            n_estimators=300, random_state=RANDOM_SEED, n_jobs=-1
         )
-    except ImportError:                       # graceful degradation
-        from sklearn.ensemble import GradientBoostingClassifier
+    if name == "xgboost":
+        try:
+            from xgboost import XGBClassifier
+            return XGBClassifier(
+                n_estimators=300, max_depth=5, learning_rate=0.1,
+                subsample=0.9, colsample_bytree=0.9,
+                random_state=RANDOM_SEED, eval_metric="logloss",
+                tree_method="hist", n_jobs=-1,
+            )
+        except ImportError:
+            from sklearn.ensemble import GradientBoostingClassifier
+            LOG.warning("xgboost not installed -- using GradientBoosting")
+            return GradientBoostingClassifier(random_state=RANDOM_SEED)
+    if name == "mlp":
+        return MLPClassifier(
+            hidden_layer_sizes=(32, 16), activation="relu", solver="adam",
+            max_iter=500, random_state=RANDOM_SEED,
+        )
+    raise ValueError(f"Unknown classifier: {name}")
 
-        LOG.warning("xgboost not installed -- substituting GradientBoosting")
-        xgb = GradientBoostingClassifier(random_state=RANDOM_SEED)
 
-    mlp = MLPClassifier(
-        hidden_layer_sizes=(32, 16), activation="relu", solver="adam",
-        max_iter=500, random_state=RANDOM_SEED,
-    )
-    return {"RandomForest": rf, "XGBoost": xgb, "MLP": mlp}
+def _display_name(key: str) -> str:
+    return {"random_forest": "RandomForest", "xgboost": "XGBoost",
+            "mlp": "MLP"}.get(key, key)
 
 
-def run_classification(rfm: pd.DataFrame) -> dict:
-    """End-to-end supervised learning pipeline."""
-    y = make_target(rfm)
+# ---------------------------------------------------------------------------
+# Driver
+# ---------------------------------------------------------------------------
+def run_classification(rfm: pd.DataFrame, cfg: PipelineConfig) -> dict:
+    """Run the full supervised pipeline driven by cfg.modeling."""
+    y = make_target(rfm, cfg)
     X = build_features(rfm)
 
-    X_train, X_test, y_train, y_test, scaler = split_and_balance(X, y)
+    X_train, X_test, y_train, y_test = split_data(
+        X, y, test_size=cfg.modeling.test_size
+    )
+    LOG.info("Split: train=%d (pos=%d) / test=%d (pos=%d)",
+             len(y_train), int(y_train.sum()),
+             len(y_test), int(y_test.sum()))
 
     results: dict[str, ClfResult] = {}
-    for name, model in get_models().items():
+    for key in cfg.modeling.classifiers:
+        name = _display_name(key)
         LOG.info("Training %s ...", name)
-        results[name] = evaluate(name, model, X_test, y_test,
-                                 X_train, y_train)
+        results[name] = evaluate(
+            name, _make_model(key),
+            X_train, y_train, X_test, y_test,
+            cv_folds=cfg.modeling.cv_folds, use_smote=cfg.modeling.smote,
+        )
+
     return {
         "results": results,
         "X_train": X_train, "X_test": X_test,
         "y_train": y_train, "y_test": y_test,
-        "scaler": scaler, "feature_names": list(X.columns),
+        "feature_names": list(X.columns),
     }
-
-
-if __name__ == "__main__":
-    rng = np.random.default_rng(RANDOM_SEED)
-    demo = pd.DataFrame({
-        "CustomerID": np.arange(2000),
-        "Recency": rng.exponential(30, 2000),
-        "Frequency": rng.poisson(5, 2000) + 1,
-        "Monetary": rng.lognormal(5, 1.2, 2000),
-    })
-    out = run_classification(demo)
-    for r in out["results"].values():
-        print(r.name, r.metrics)

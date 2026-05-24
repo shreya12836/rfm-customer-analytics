@@ -1,31 +1,22 @@
 """
 clustering.py
 -------------
-Unsupervised customer segmentation.
+Customer segmentation on the scaled RFM matrix.
 
-Models implemented
-~~~~~~~~~~~~~~~~~~
-- K-Means (with elbow + silhouette diagnostics for optimal k)
+Models:
+- K-Means (k chosen by silhouette over cfg.modeling.k_range)
 - DBSCAN
-- Gaussian Mixture Model
-- Deep clustering: PyTorch Autoencoder + KMeans on the latent space
+- Gaussian Mixture Model (k chosen by BIC over the same range)
+- Autoencoder followed by KMeans on the latent codes
 
-Each clustering routine returns labels and a metric dict (silhouette,
-Davies-Bouldin, Calinski-Harabasz). Noise points from DBSCAN are excluded
-from internal validation indices since those metrics are undefined for
-the noise label.
-
-Business note
-~~~~~~~~~~~~~
-Segments derived here support strategic actions: champions to retain,
-loyal customers to nurture, at-risk to win back, and one-time buyers to
-either re-activate or de-prioritise.
+Each routine returns labels plus silhouette, Davies-Bouldin, and
+Calinski-Harabasz on the non-noise subset. Which models run is set in
+cfg.modeling.cluster_models.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -38,9 +29,11 @@ from sklearn.metrics import (
 from sklearn.mixture import GaussianMixture
 
 try:
-    from .utils import RANDOM_SEED, get_logger, get_paths, set_global_seed
+    from .config import PipelineConfig
+    from .utils import RANDOM_SEED, get_logger, set_global_seed
 except ImportError:
-    from utils import RANDOM_SEED, get_logger, get_paths, set_global_seed  # type: ignore
+    from config import PipelineConfig  # type: ignore
+    from utils import RANDOM_SEED, get_logger, set_global_seed  # type: ignore
 
 LOG = get_logger("clustering")
 
@@ -75,11 +68,17 @@ def _internal_metrics(X: np.ndarray, labels: np.ndarray) -> dict:
     return out
 
 
+def _resolve_k_range(cfg: PipelineConfig) -> range:
+    kr = cfg.modeling.k_range
+    if len(kr) != 2:
+        raise ValueError(f"k_range must be [start, stop], got {kr}")
+    return range(kr[0], kr[1])
+
+
 # ---------------------------------------------------------------------------
 # K-Means
 # ---------------------------------------------------------------------------
-def kmeans_diagnostics(X: np.ndarray,
-                       k_range: range = range(2, 11)) -> pd.DataFrame:
+def kmeans_diagnostics(X: np.ndarray, k_range: range) -> pd.DataFrame:
     """Compute inertia (elbow) and silhouette for each candidate k."""
     rows = []
     for k in k_range:
@@ -96,50 +95,58 @@ def kmeans_diagnostics(X: np.ndarray,
 
 
 def choose_optimal_k(diag: pd.DataFrame) -> int:
-    """Pick the k that maximises silhouette score."""
     best = int(diag.loc[diag["silhouette"].idxmax(), "k"])
-    LOG.info("Optimal k by silhouette = %d", best)
+    LOG.info("Optimal k (KMeans, silhouette) = %d", best)
     return best
 
 
 def fit_kmeans(X: np.ndarray, k: int) -> ClusteringResult:
     km = KMeans(n_clusters=k, n_init=10, random_state=RANDOM_SEED)
     labels = km.fit_predict(X)
-    metrics = _internal_metrics(X, labels)
     return ClusteringResult(
-        name=f"KMeans(k={k})", labels=labels, metrics=metrics,
-        extra={"model": km},
+        name=f"KMeans(k={k})", labels=labels,
+        metrics=_internal_metrics(X, labels), extra={"model": km},
     )
 
 
 # ---------------------------------------------------------------------------
 # DBSCAN
 # ---------------------------------------------------------------------------
-def fit_dbscan(X: np.ndarray, eps: float = 0.5,
-               min_samples: int = 10) -> ClusteringResult:
+def fit_dbscan(X: np.ndarray, eps: float, min_samples: int) -> ClusteringResult:
     db = DBSCAN(eps=eps, min_samples=min_samples)
     labels = db.fit_predict(X)
     metrics = _internal_metrics(X, labels)
-    LOG.info("DBSCAN: %d clusters, %d noise points",
-             metrics["n_clusters"], metrics["n_noise"])
+    LOG.info("DBSCAN(eps=%.2f, min_samples=%d): %d clusters, %d noise",
+             eps, min_samples, metrics["n_clusters"], metrics["n_noise"])
     return ClusteringResult(name="DBSCAN", labels=labels, metrics=metrics,
                             extra={"model": db})
 
 
 # ---------------------------------------------------------------------------
-# Gaussian Mixture
+# Gaussian Mixture, k selected by BIC sweep
 # ---------------------------------------------------------------------------
-def fit_gmm(X: np.ndarray, n_components: int) -> ClusteringResult:
-    gmm = GaussianMixture(n_components=n_components,
-                          covariance_type="full",
-                          random_state=RANDOM_SEED, n_init=3)
-    labels = gmm.fit_predict(X)
+def fit_gmm_bic_sweep(X: np.ndarray, k_range: range) -> ClusteringResult:
+    """Fit GMMs over k_range and return the one with the lowest BIC."""
+    rows = []
+    best_gmm, best_k, best_bic = None, None, np.inf
+    for k in k_range:
+        gmm = GaussianMixture(n_components=k, covariance_type="full",
+                              random_state=RANDOM_SEED, n_init=3)
+        gmm.fit(X)
+        bic = float(gmm.bic(X))
+        rows.append({"k": k, "bic": bic, "aic": float(gmm.aic(X))})
+        if bic < best_bic:
+            best_bic, best_k, best_gmm = bic, k, gmm
+    sweep = pd.DataFrame(rows)
+    LOG.info("GMM BIC sweep:\n%s", sweep.to_string(index=False))
+    LOG.info("Optimal k (GMM, BIC) = %d", best_k)
+
+    labels = best_gmm.predict(X)
     metrics = _internal_metrics(X, labels)
-    metrics["bic"] = float(gmm.bic(X))
-    metrics["aic"] = float(gmm.aic(X))
+    metrics.update(bic=best_bic, aic=float(best_gmm.aic(X)))
     return ClusteringResult(
-        name=f"GMM(k={n_components})", labels=labels,
-        metrics=metrics, extra={"model": gmm},
+        name=f"GMM(k={best_k})", labels=labels, metrics=metrics,
+        extra={"model": best_gmm, "sweep": sweep, "k_opt": best_k},
     )
 
 
@@ -147,10 +154,9 @@ def fit_gmm(X: np.ndarray, n_components: int) -> ClusteringResult:
 # Autoencoder + KMeans (deep clustering)
 # ---------------------------------------------------------------------------
 def fit_autoencoder_kmeans(X: np.ndarray, k: int,
-                           epochs: int = 50,
-                           batch_size: int = 64,
-                           lr: float = 1e-3) -> ClusteringResult:
-    """Train an MLP autoencoder, KMeans-cluster the latent codes."""
+                           epochs: int, batch_size: int,
+                           lr: float) -> ClusteringResult:
+    """Train an MLP autoencoder and run KMeans on the latent codes."""
     import torch
     from torch import nn
     from torch.utils.data import DataLoader, TensorDataset
@@ -162,8 +168,6 @@ def fit_autoencoder_kmeans(X: np.ndarray, k: int,
     in_dim = X.shape[1]
 
     class AE(nn.Module):
-        """Input -> 16 -> 8 -> 4 (latent) -> 8 -> 16 -> Output."""
-
         def __init__(self) -> None:
             super().__init__()
             self.encoder = nn.Sequential(
@@ -213,9 +217,9 @@ def fit_autoencoder_kmeans(X: np.ndarray, k: int,
 
     km = KMeans(n_clusters=k, n_init=10, random_state=RANDOM_SEED)
     labels = km.fit_predict(latent_np)
-    metrics = _internal_metrics(latent_np, labels)
     return ClusteringResult(
-        name=f"AE+KMeans(k={k})", labels=labels, metrics=metrics,
+        name=f"AE+KMeans(k={k})", labels=labels,
+        metrics=_internal_metrics(latent_np, labels),
         extra={"history": history, "latent": latent_np, "model": model},
     )
 
@@ -223,35 +227,36 @@ def fit_autoencoder_kmeans(X: np.ndarray, k: int,
 # ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
-def run_all_clustering(X: np.ndarray) -> dict[str, ClusteringResult]:
-    """Run every clustering algorithm and return a {name: result} dict."""
+def run_all_clustering(X: np.ndarray,
+                       cfg: PipelineConfig) -> dict[str, ClusteringResult]:
+    """Run each algorithm listed in cfg.modeling.cluster_models."""
     set_global_seed(RANDOM_SEED)
+    k_range = _resolve_k_range(cfg)
 
-    diag = kmeans_diagnostics(X)
+    diag = kmeans_diagnostics(X, k_range)
     k_opt = choose_optimal_k(diag)
 
-    results = {
-        "kmeans": fit_kmeans(X, k_opt),
-        "dbscan": fit_dbscan(X, eps=0.6, min_samples=10),
-        "gmm": fit_gmm(X, n_components=k_opt),
-        "ae_kmeans": fit_autoencoder_kmeans(X, k=k_opt, epochs=50),
-    }
+    selected = set(cfg.modeling.cluster_models)
+    results: dict[str, ClusteringResult] = {}
+
+    if "kmeans" in selected:
+        results["kmeans"] = fit_kmeans(X, k_opt)
+    if "dbscan" in selected:
+        results["dbscan"] = fit_dbscan(
+            X, eps=cfg.modeling.dbscan_eps,
+            min_samples=cfg.modeling.dbscan_min_samples,
+        )
+    if "gmm" in selected:
+        results["gmm"] = fit_gmm_bic_sweep(X, k_range)
+    if "ae_kmeans" in selected:
+        ae_cfg = cfg.modeling.autoencoder
+        results["ae_kmeans"] = fit_autoencoder_kmeans(
+            X, k=k_opt, epochs=ae_cfg.epochs,
+            batch_size=ae_cfg.batch_size, lr=ae_cfg.lr,
+        )
+
     results["_diagnostics"] = ClusteringResult(
         name="kmeans_diag", labels=np.array([]),
         metrics={}, extra={"diag": diag, "k_opt": k_opt},
     )
     return results
-
-
-if __name__ == "__main__":
-    rng = np.random.default_rng(RANDOM_SEED)
-    X_demo = np.vstack([
-        rng.normal(loc=(0, 0, 0), scale=0.4, size=(150, 3)),
-        rng.normal(loc=(3, 3, 3), scale=0.4, size=(150, 3)),
-        rng.normal(loc=(-3, 3, -3), scale=0.4, size=(150, 3)),
-    ])
-    res = run_all_clustering(X_demo)
-    for name, r in res.items():
-        if name.startswith("_"):
-            continue
-        LOG.info("%s -> %s", r.name, r.metrics)
