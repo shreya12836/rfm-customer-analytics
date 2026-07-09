@@ -1,74 +1,172 @@
-# Customer Value Prediction: Deep Clustering + Leakage-Safe Classification
+# RFM Customer Analytics & High-Value Spender Prediction
 
-A config-driven pipeline that segments retail customers by purchase behavior and predicts which ones are high-value — built to be correct under evaluation, not just to produce a plot.
+A customer analytics pipeline for customer segmentation and high-value spender prediction, built with deep clustering, explainable machine learning, and reproducible, leakage-safe evaluation.
 
-## Problem
+---
 
-Retailers need to know which customers are worth retaining before they churn, but naive segmentation (e.g., manual RFM thresholds) misses non-linear structure in purchase behavior, and naive classification pipelines routinely leak information during cross-validation, producing scores that don't hold up in production.
+## Overview
 
-## Approach
+Customer segmentation is fundamental to targeted marketing, personalized engagement, and customer retention. While traditional RFM thresholding provides a simple segmentation strategy, it often overlooks complex purchasing behaviors. Likewise, many customer value prediction pipelines unintentionally introduce data leakage during evaluation, resulting in overly optimistic performance.
 
-The pipeline runs in five stages: preprocess → cluster → classify → explain → report.
+This project implements a configurable machine learning pipeline that combines **RFM feature engineering**, **deep clustering**, **supervised learning**, and **SHAP explainability** to identify high-value customers while following robust evaluation practices.
 
-1. **RFM feature engineering** — Recency, Frequency, Monetary computed from raw transactions, log-transformed and scaled per a YAML-configurable strategy.
-2. **Unsupervised segmentation** — four clustering approaches are run and compared on the same scaled features, so the best method is chosen by evidence, not assumption.
-3. **Supervised classification** — three models predict top-quartile spenders from Recency and Frequency alone (Monetary is excluded because it defines the label).
-4. **Explainability** — SHAP quantifies which behavioral signal actually drives the prediction.
+---
+
+## Key Features
+
+- RFM feature engineering from transaction-level retail data
+- Deep customer segmentation using **Autoencoder + K-Means**
+- High-value spender prediction using **Random Forest**, **XGBoost**, and **MLP**
+- SHAP-based model explainability
+- Leakage-safe evaluation with **SMOTE** inside cross-validation
+- Configuration-driven pipeline using YAML
+- Reproducible experiments with deterministic training
+
+---
+
+## Pipeline Overview
+
+```text
+Raw Transactions
+        │
+        ▼
+RFM Feature Engineering
+        │
+        ▼
+Scaling & Preprocessing
+        │
+        ▼
+Customer Segmentation
+(K-Means | DBSCAN | Gaussian Mixture | Autoencoder + K-Means)
+        │
+        ▼
+High-Value Spender Prediction
+(Random Forest | XGBoost | MLP)
+        │
+        ▼
+SHAP Explainability
+        │
+        ▼
+Reports & Visualizations
+```
+
+---
 
 ## Results
 
-**Clustering** (5,675 customers, evaluated on Silhouette, Davies-Bouldin, Calinski-Harabasz):
+### Customer Segmentation
+
+The clustering pipeline was evaluated on **5,675 customers** using **Silhouette Score**, **Davies-Bouldin Index**, and **Calinski-Harabasz Score**.
 
 | Algorithm | Silhouette ↑ | Davies-Bouldin ↓ | Calinski-Harabasz ↑ |
-|---|:---:|:---:|:---:|
+|-----------|-------------:|-----------------:|--------------------:|
 | K-Means | 0.437 | 0.873 | 6,018 |
-| Gaussian Mixture (BIC-selected k) | 0.309 | 0.977 | 3,232 |
-| DBSCAN | collapsed at default eps | n/a | n/a |
+| Gaussian Mixture | 0.309 | 0.977 | 3,232 |
+| DBSCAN | Collapsed at default `eps` | — | — |
 | **Autoencoder + K-Means** | **0.574** | **0.622** | **11,748** |
 
-The autoencoder (3-16-8-4-8-16-3) learns a non-linear latent representation before clustering, and wins on all three metrics. It resolves two actionable segments: **Champions** (n=2,267, recent and frequent buyers with high spend) and **Loyal-but-lapsing** (n=3,408, ~300 days since last purchase).
+The Autoencoder learned a non-linear latent representation before clustering and consistently outperformed traditional clustering methods across all evaluation metrics. The resulting customer segments captured two actionable behavioral groups:
 
-**Classification** (top-25% Monetary, 75/25 split, test set):
+- **Champions** — Recent, frequent, and high-spending customers.
+- **Loyal-but-Lapsing** — Historically valuable customers with declining purchasing activity.
+
+---
+
+### High-Value Spender Prediction
+
+Customers in the **top 25% of Monetary value** were classified using three supervised learning models.
 
 | Model | Accuracy | Precision | Recall | F1 | ROC-AUC |
-|---|:---:|:---:|:---:|:---:|:---:|
+|------|---------:|----------:|-------:|---:|--------:|
 | Random Forest | 0.875 | 0.720 | 0.817 | 0.765 | 0.931 |
 | **XGBoost** | **0.885** | 0.715 | 0.899 | **0.797** | 0.952 |
 | MLP | 0.865 | 0.665 | 0.924 | 0.774 | **0.956** |
 
-**SHAP** (XGBoost): Frequency drives the prediction roughly 4x more than Recency (mean \|SHAP\| 2.73 vs 0.66) — customers are flagged as high-value primarily because they buy often, not because they bought recently. Monetary is excluded from the feature set since it defines the label.
+**XGBoost** achieved the best balance between precision and recall, while the **MLP** obtained the highest ROC-AUC.
+
+---
+
+### Model Explainability
+
+SHAP analysis revealed that **Frequency** contributes approximately **4× more** than **Recency** when predicting high-value customers, indicating that purchase frequency is the strongest behavioral signal for customer value.
+
+---
 
 ## Engineering Highlights
 
-- **Leakage-safe evaluation by construction.** SMOTE sits inside an `imblearn.pipeline.Pipeline` alongside the scaler, so it is refit on each cross-validation fold rather than applied once to the full training set — a common source of inflated CV scores in imbalanced classification that this design rules out structurally. After moving SMOTE inside CV, test-set numbers were unchanged but CV F1 estimates dropped closer to test F1, consistent with an unbiased CV.
-- **Config-driven, not hardcoded.** Every pipeline decision — data schema, cleaning rules, feature scaling, label definition, model selection, hyperparameters — is declared in YAML and validated at load time (`src/config.py`). Pointing the pipeline at a different retail dataset is a config change, not a code change; see [configs/online_retail_ii.yaml](configs/online_retail_ii.yaml) for the commented baseline.
-- **Reproducible end-to-end.** All stochastic steps (clustering, splitting, model training) are seeded (`SEED = 42`); a `python main.py --config <path>` run regenerates the exact tables and figures in `outputs/`.
-- **Explainability wired into the pipeline, not bolted on.** SHAP's TreeExplainer runs on the best tree model with the pipeline automatically unwrapped so it sees the raw estimator and pre-scaled features.
+- **Leakage-safe evaluation** — SMOTE is applied inside every cross-validation fold using an `imblearn.pipeline.Pipeline`, preventing synthetic samples from leaking into validation data.
+- **Configuration-driven pipeline** — Preprocessing, feature engineering, model selection, and hyperparameters are managed through YAML configuration files.
+- **Reproducible experiments** — All stochastic processes are seeded to ensure deterministic training and evaluation.
+- **Integrated explainability** — SHAP explanations are automatically generated for the best-performing tree-based model.
+
+---
+
+## Repository Structure
+
+```text
+.
+├── configs/
+├── data/
+├── outputs/
+├── src/
+├── tests/
+├── main.py
+├── requirements.txt
+└── README.md
+```
+
+---
+
+## Installation
+
+Clone the repository and install the required dependencies.
+
+```bash
+git clone https://github.com/shreya12836/rfm-customer-analytics.git
+cd rfm-customer-analytics
+pip install -r requirements.txt
+```
+
+---
 
 ## Usage
 
+Run the complete pipeline:
+
 ```bash
-pip install -r requirements.txt
 python main.py --config configs/online_retail_ii.yaml
 ```
 
-Downloads `online_retail_II.xlsx` into `data/` on first run (~45 MB), runs the full pipeline, and writes results to `outputs/figures/` and `outputs/tables/`. End-to-end runtime is roughly 3-5 minutes on a laptop.
-
-To run on a different dataset, write a new YAML config mapping your source columns to the canonical schema (`customer_id`, `transaction_id`, `transaction_date`, `quantity`, `unit_price`, `revenue`) — no code changes needed:
+To evaluate a different retail dataset, create a new YAML configuration that maps your dataset to the required schema and run:
 
 ```bash
-python examples/generate_synthetic.py
-python main.py --config configs/sample_synthetic.yaml
+python main.py --config path/to/config.yaml
 ```
 
-## Data
+---
 
-[UCI Online Retail II](https://archive.ics.uci.edu/ml/machine-learning-databases/00502/online_retail_II.xlsx) — real transaction-level e-commerce data, 5,675 customers after cleaning (cancellations, missing customer IDs, and non-positive quantities/prices removed).
+## Dataset
+
+This project uses the **UCI Online Retail II** dataset.
+
+- Transaction-level e-commerce data
+- **5,675 customers** after preprocessing
+- Cancellations, missing customer IDs, and invalid transactions removed
+
+Dataset: https://archive.ics.uci.edu/ml/datasets/Online+Retail+II
+
+---
 
 ## Tech Stack
 
-`Python 3.11` · `pandas` · `numpy` · `scikit-learn` · `XGBoost` · `PyTorch` · `imbalanced-learn` · `SHAP` · `matplotlib` · `PyYAML`
+| Category | Technologies |
+|----------|--------------|
+| **Language** | Python |
+| **Machine Learning** | Scikit-learn, XGBoost, PyTorch, SHAP, imbalanced-learn |
+| **Data Processing** | Pandas, NumPy |
+| **Visualization** | Matplotlib |
+| **Configuration** | PyYAML |
 
-## Author
+---
 
-**Shreya Mishra** · Centre of Quantitative Economics and Data Science, BIT Mesra
+
