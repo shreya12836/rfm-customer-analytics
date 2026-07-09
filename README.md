@@ -1,129 +1,74 @@
-# Customer Segmentation and High-Value Spender Prediction
+# Customer Value Prediction: Deep Clustering + Leakage-Safe Classification
 
-A YAML-driven pipeline for any transactional customer dataset. It computes per-customer RFM features, segments customers with four clustering algorithms (one of which is a PyTorch autoencoder followed by KMeans), and predicts top-quartile spenders with Random Forest, XGBoost, and an MLP. SMOTE is used inside cross-validation to handle class imbalance. SHAP explains the best tree model.
+A config-driven pipeline that segments retail customers by purchase behavior and predicts which ones are high-value — built to be correct under evaluation, not just to produce a plot.
 
----
+## Problem
 
-## Running on the UCI Online Retail II dataset
+Retailers need to know which customers are worth retaining before they churn, but naive segmentation (e.g., manual RFM thresholds) misses non-linear structure in purchase behavior, and naive classification pipelines routinely leak information during cross-validation, producing scores that don't hold up in production.
+
+## Approach
+
+The pipeline runs in five stages: preprocess → cluster → classify → explain → report.
+
+1. **RFM feature engineering** — Recency, Frequency, Monetary computed from raw transactions, log-transformed and scaled per a YAML-configurable strategy.
+2. **Unsupervised segmentation** — four clustering approaches are run and compared on the same scaled features, so the best method is chosen by evidence, not assumption.
+3. **Supervised classification** — three models predict top-quartile spenders from Recency and Frequency alone (Monetary is excluded because it defines the label).
+4. **Explainability** — SHAP quantifies which behavioral signal actually drives the prediction.
+
+## Results
+
+**Clustering** (5,675 customers, evaluated on Silhouette, Davies-Bouldin, Calinski-Harabasz):
+
+| Algorithm | Silhouette ↑ | Davies-Bouldin ↓ | Calinski-Harabasz ↑ |
+|---|:---:|:---:|:---:|
+| K-Means | 0.437 | 0.873 | 6,018 |
+| Gaussian Mixture (BIC-selected k) | 0.309 | 0.977 | 3,232 |
+| DBSCAN | collapsed at default eps | n/a | n/a |
+| **Autoencoder + K-Means** | **0.574** | **0.622** | **11,748** |
+
+The autoencoder (3-16-8-4-8-16-3) learns a non-linear latent representation before clustering, and wins on all three metrics. It resolves two actionable segments: **Champions** (n=2,267, recent and frequent buyers with high spend) and **Loyal-but-lapsing** (n=3,408, ~300 days since last purchase).
+
+**Classification** (top-25% Monetary, 75/25 split, test set):
+
+| Model | Accuracy | Precision | Recall | F1 | ROC-AUC |
+|---|:---:|:---:|:---:|:---:|:---:|
+| Random Forest | 0.875 | 0.720 | 0.817 | 0.765 | 0.931 |
+| **XGBoost** | **0.885** | 0.715 | 0.899 | **0.797** | 0.952 |
+| MLP | 0.865 | 0.665 | 0.924 | 0.774 | **0.956** |
+
+**SHAP** (XGBoost): Frequency drives the prediction roughly 4x more than Recency (mean \|SHAP\| 2.73 vs 0.66) — customers are flagged as high-value primarily because they buy often, not because they bought recently. Monetary is excluded from the feature set since it defines the label.
+
+## Engineering Highlights
+
+- **Leakage-safe evaluation by construction.** SMOTE sits inside an `imblearn.pipeline.Pipeline` alongside the scaler, so it is refit on each cross-validation fold rather than applied once to the full training set — a common source of inflated CV scores in imbalanced classification that this design rules out structurally. After moving SMOTE inside CV, test-set numbers were unchanged but CV F1 estimates dropped closer to test F1, consistent with an unbiased CV.
+- **Config-driven, not hardcoded.** Every pipeline decision — data schema, cleaning rules, feature scaling, label definition, model selection, hyperparameters — is declared in YAML and validated at load time (`src/config.py`). Pointing the pipeline at a different retail dataset is a config change, not a code change; see [configs/online_retail_ii.yaml](configs/online_retail_ii.yaml) for the commented baseline.
+- **Reproducible end-to-end.** All stochastic steps (clustering, splitting, model training) are seeded (`SEED = 42`); a `python main.py --config <path>` run regenerates the exact tables and figures in `outputs/`.
+- **Explainability wired into the pipeline, not bolted on.** SHAP's TreeExplainer runs on the best tree model with the pipeline automatically unwrapped so it sees the raw estimator and pre-scaled features.
+
+## Usage
 
 ```bash
 pip install -r requirements.txt
 python main.py --config configs/online_retail_ii.yaml
 ```
 
-The script downloads `online_retail_II.xlsx` into `data/` on first run (around 45 MB), runs the full pipeline, and writes outputs to `outputs/figures/` and `outputs/tables/`. End-to-end time is roughly 3 to 5 minutes on a laptop.
+Downloads `online_retail_II.xlsx` into `data/` on first run (~45 MB), runs the full pipeline, and writes results to `outputs/figures/` and `outputs/tables/`. End-to-end runtime is roughly 3-5 minutes on a laptop.
 
-## Running on a different dataset
-
-Every dataset-specific choice lives in a YAML config. To work on a new dataset, write a new config that maps your source columns to the canonical ones the pipeline uses.
+To run on a different dataset, write a new YAML config mapping your source columns to the canonical schema (`customer_id`, `transaction_id`, `transaction_date`, `quantity`, `unit_price`, `revenue`) — no code changes needed:
 
 ```bash
 python examples/generate_synthetic.py
 python main.py --config configs/sample_synthetic.yaml
 ```
 
-A config has six sections. See [configs/online_retail_ii.yaml](configs/online_retail_ii.yaml) for the commented baseline.
+## Data
 
-```yaml
-dataset:    # loader (csv / excel / parquet), path, optional download_url
-schema:     # source -> canonical: customer_id, transaction_id,
-            # transaction_date, quantity, unit_price, revenue
-cleaning:   # cancellation rule, missing/non-positive/duplicate drops,
-            # outlier method (iqr / zscore / none) + columns
-features:   # log1p toggle, scaler choice, snapshot date for Recency
-target:     # top_quantile (default 0.75) / threshold / top_n
-modeling:   # test_size, smote, cv_folds, which models to run,
-            # k_range, dbscan params, autoencoder hyperparams
-output:     # figures_dir, tables_dir
-```
+[UCI Online Retail II](https://archive.ics.uci.edu/ml/machine-learning-databases/00502/online_retail_II.xlsx) — real transaction-level e-commerce data, 5,675 customers after cleaning (cancellations, missing customer IDs, and non-positive quantities/prices removed).
 
-To add a new dataset: copy `configs/online_retail_ii.yaml`, edit the schema, path, and cleaning toggles, then run `python main.py --config configs/your_dataset.yaml`.
+## Tech Stack
 
----
-
-## Pipeline
-
-1. **Preprocessing**. Load source with the configured loader. Rename source columns to canonical names. Apply the configured cleaning and outlier rules. Aggregate to per-customer Recency, Frequency, Monetary. Apply log1p (optional) and the chosen scaler.
-2. **Clustering**. K-Means with an elbow plus silhouette sweep to pick `k`. DBSCAN. Gaussian Mixture with a BIC sweep that picks its own `k`. An MLP autoencoder (3-16-8-4-8-16-3) followed by KMeans on the latent codes.
-3. **Classification**. Predict the configured high-value label. Random Forest, XGBoost, and an MLP. Each model is wrapped in an `imblearn.pipeline.Pipeline` so the StandardScaler and SMOTE run inside each CV fold rather than once on the whole training set. Running SMOTE before `cross_val_score` causes information from held-out folds to leak into training and inflates CV scores.
-4. **Explainability**. SHAP TreeExplainer on the best tree model. The pipeline is unwrapped automatically so SHAP sees the raw tree estimator and the pre-scaled feature matrix.
-
-All randomness is seeded with `SEED = 42`.
-
----
-
-## Results on UCI Online Retail II
-
-### Clustering, 5,675 customers, two-cluster solution
-
-| Algorithm                         | Silhouette | Davies-Bouldin | Calinski-Harabasz |
-|-----------------------------------|:---:|:---:|:---:|
-| K-Means                           | 0.437 | 0.873 | 6,018 |
-| DBSCAN                            | collapsed at default eps | n/a | n/a |
-| Gaussian Mixture (BIC-selected k) | 0.309 | 0.977 | 3,232 |
-| **Autoencoder + KMeans**          | **0.574** | **0.622** | **11,748** |
-
-The two segments are Champions (n=2,267, recent and frequent buyers with high spend) and Loyal-but-lapsing (n=3,408, around 300 days since last purchase).
-
-### Classification, top-25 percent Monetary, 75/25 split, test set
-
-| Model           | Accuracy | Precision | Recall | F1 | ROC-AUC |
-|-----------------|:---:|:---:|:---:|:---:|:---:|
-| Random Forest   | 0.875 | 0.720 | 0.817 | 0.765 | 0.931 |
-| **XGBoost**     | **0.885** | 0.715 | 0.899 | **0.797** | 0.952 |
-| MLP             | 0.865 | 0.665 | 0.924 | 0.774 | **0.956** |
-
-After moving SMOTE inside CV, the test numbers above are unchanged but the CV F1 estimates drop closer to test F1, which is what an unbiased CV should look like.
-
-### SHAP attribution on the XGBoost model
-
-| Feature   | mean \|SHAP\| |
-|-----------|:---:|
-| Frequency | 2.73 |
-| Recency   | 0.66 |
-
-Frequency dominates Recency by roughly four to one. Monetary is held out of the feature set because it defines the label.
-
----
-
-## Project layout
-
-```
-sml_project/
-├── configs/
-│   ├── online_retail_ii.yaml      # UCI baseline (commented)
-│   └── sample_synthetic.yaml      # demo using non-UCI column names
-├── examples/
-│   └── generate_synthetic.py      # writes data/synthetic_transactions.csv
-├── data/                          # datasets live here
-├── src/
-│   ├── config.py                  # YAML loader and dataclass validation
-│   ├── preprocess.py              # loader, schema mapping, RFM
-│   ├── clustering.py              # KMeans, DBSCAN, GMM (BIC), AE+KMeans
-│   ├── classification.py          # RF, XGB, MLP, SMOTE inside CV
-│   ├── evaluation.py              # metric tables and SHAP
-│   ├── visualisation.py           # figures
-│   └── utils.py
-├── outputs/
-│   ├── figures/                   # 9 PNGs at 300 dpi
-│   └── tables/                    # 9 CSVs
-├── main.py                        # python main.py --config <path>
-├── requirements.txt
-└── README.md
-```
-
----
-
-## Tech stack
-
-`Python 3.11`, `pandas`, `numpy`, `scikit-learn`, `XGBoost`, `PyTorch`, `imbalanced-learn`, `SHAP`, `matplotlib`, `PyYAML`.
-
----
+`Python 3.11` · `pandas` · `numpy` · `scikit-learn` · `XGBoost` · `PyTorch` · `imbalanced-learn` · `SHAP` · `matplotlib` · `PyYAML`
 
 ## Author
 
-**Shreya Mishra** &nbsp;·&nbsp; 
-Centre of Quantitative Economics and Data Science, BIT Mesra
-
-
-
+**Shreya Mishra** · Centre of Quantitative Economics and Data Science, BIT Mesra
